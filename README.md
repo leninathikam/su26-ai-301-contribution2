@@ -73,32 +73,45 @@ I picked this issue because:
 
 ### Reproduction Process
 
-**Steps I took to set up the project locally and reproduce the problem.**
+**Setup path:** I did **not** use a dev container. I followed install and test instructions from [CONTRIBUTING.md](https://github.com/huggingface/smolagents/blob/main/CONTRIBUTING.md) and inspected CI config in `.github/workflows/quality.yml` and `.github/workflows/tests.yml` to see that PRs must pass `ruff check`, `ruff format --check`, and `pytest ./tests/` on Ubuntu with Python 3.10 and 3.12.
 
 #### Environment Setup
 
-- **OS:** Windows 11
-- **Python:** 3.14.3 (local); CI uses 3.10 and 3.12 on Ubuntu
-- **Package:** smolagents 1.27.0.dev0 (cloned from `main`)
+| Item | Detail |
+|------|--------|
+| **OS** | Windows 11 |
+| **Python** | 3.14.3 (local); CI uses 3.10 and 3.12 on Ubuntu |
+| **Package** | smolagents 1.27.0.dev0 (cloned from `main`) |
+| **Fork** | [https://github.com/leninathikam/smolagents](https://github.com/leninathikam/smolagents) |
+| **Branch** | `fix/timeout-deadlock-2464` — [https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464](https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464) |
+
+**Challenge encountered and fix:**
+
+- **Error:** `pip install -e ".[dev]"` failed with `ERROR: No matching distribution found for mlx[cpu]`
+- **Cause:** The `test` extra in `pyproject.toml` lists `mlx[cpu]`, which is macOS-only and not available on Windows
+- **Fix:** Installed the base package plus manual test deps: `pip install -e .` then `pip install pytest numpy pandas ruff`
 
 **Setup steps:**
 
-1. Cloned upstream repo:
+1. Clone upstream and create a branch named after the issue:
    ```bash
    git clone https://github.com/huggingface/smolagents.git
    cd smolagents
    git checkout -b fix/timeout-deadlock-2464
    ```
-2. Installed the package and test dependencies:
+2. Install dependencies (see challenge above if `".[dev]"` fails on Windows).
+3. Point `origin` at your fork and push the branch when ready:
    ```bash
-   pip install -e .
-   pip install pytest numpy pandas ruff
+   git remote rename origin upstream
+   git remote add origin https://github.com/leninathikam/smolagents.git
    ```
-   Note: `pip install -e ".[dev]"` failed on Windows because the test extra pulls in `mlx[cpu]`, which is macOS-only. For local work, installing the base package plus pytest and ruff was enough.
 
-3. Read the bug location at `src/smolagents/local_python_executor.py` (the `timeout()` decorator around lines 285–320).
+#### Reproduction Steps
 
-4. Ran the reproduction pattern from the issue:
+Steps another person could follow without extra context:
+
+1. Open `src/smolagents/local_python_executor.py` and locate the `timeout()` decorator (around lines 285–320).
+2. Create a small Python script (or REPL) with the reproduction from issue #2464:
    ```python
    import time
    from smolagents.local_python_executor import timeout, ExecutionTimeoutError
@@ -108,54 +121,92 @@ I picked this issue because:
        time.sleep(30)
        return "done"
 
-   hangs_forever()  # expected: ExecutionTimeoutError; old code: process freezes
+   hangs_forever()
    ```
+3. Run the script against the **original** code (with `with ThreadPoolExecutor(...)`).
+4. Observe whether the process returns an exception or freezes.
+5. Optionally run existing tests: `pytest tests/test_local_python_executor.py::TestTimeout -v` and note that `test_timeout_decorator_raises_error_when_exceeded` uses `sleep(2)` with a 1s timeout, which eventually completes because the worker thread wakes up.
 
-**What I observed:**
+#### Expected vs Actual Behavior
 
-- With the original `with ThreadPoolExecutor(...)` implementation, a call that outlives the timeout could block the process on executor shutdown instead of returning quickly
-- The issue reporter’s proposed fix (`shutdown(wait=False)` on the timeout path) matched the behavior I expected
-- Existing tests like `test_timeout_decorator_raises_error_when_exceeded` used `time.sleep(2)` with a 1-second timeout. That case eventually completes because the worker thread wakes up, so it did not catch an infinite hang
+| | Behavior |
+|---|----------|
+| **Expected** | After 1 second, `hangs_forever()` raises `ExecutionTimeoutError` with message `Code execution exceeded the maximum execution time of 1 seconds`. The main script continues and can run more code. |
+| **Actual (buggy code)** | `future.result(timeout=1)` times out internally, but exiting the `with ThreadPoolExecutor(...)` block calls `executor.shutdown(wait=True)`. The worker thread is still in `time.sleep(30)` (or an infinite loop), so shutdown blocks forever. No exception reaches the caller. The process appears alive with near-zero CPU and no traceback. |
 
-**Status:** Bug understood and reproduction path confirmed. Fix direction was clear before coding.
+**Status:** Bug reproduced and understood. Fix direction confirmed before implementation.
 
-### Solution Approach
+### Solution Approach (UMPIRE)
 
-**My planned fix. Which files are involved? What will I change and why?**
+#### Understand
+
+Restate the problem: The `timeout()` decorator must stop long-running agent code and raise `ExecutionTimeoutError`. The bug is not that `future.result(timeout=...)` fails to time out. The bug is that **executor shutdown after timeout blocks forever** when the worker thread never exits.
+
+**Root cause (not just symptom):**
+
+- Symptom: process freezes on hung calls
+- Root cause: `ThreadPoolExecutor` context manager calls `shutdown(wait=True)` on exit; Python cannot kill a stuck worker thread, so `wait=True` deadlocks when the wrapped call hangs indefinitely
+
+**Files and functions involved:**
+
+| Path | Role |
+|------|------|
+| `src/smolagents/local_python_executor.py` | `timeout()` decorator (~lines 285–325), `ExecutionTimeoutError` class |
+| `tests/test_local_python_executor.py` | `TestTimeout` class — existing timeout tests |
+
+#### Match
+
+Analogous pattern already in the codebase:
+
+- **`test_timeout_works_in_thread`** (`tests/test_local_python_executor.py`, ~line 2238): Documents that the threading-based `timeout()` replaced signal-based timeouts because signals only work on the main thread. My fix must preserve timeout behavior when called from worker threads, not only the main thread.
+- **`timeout()` docstring** (lines 298–301): Already warns that timed-out threads keep running in the background. That matches using `shutdown(wait=False)` on timeout: we accept a leaked background thread rather than blocking the caller.
+- **Existing test `test_timeout_decorator_raises_error_when_exceeded`**: Uses `sleep(2)` with 1s timeout. This passes on buggy code because the worker eventually finishes. My new test must use a **non-terminating** hang to catch the shutdown deadlock.
 
 #### Plan
 
-1. Replace the `with ThreadPoolExecutor(...)` context manager with explicit executor lifecycle control
-2. On `FuturesTimeoutError`, call `executor.shutdown(wait=False)` so a stuck worker does not block the caller
-3. On success (and non-timeout paths), call `executor.shutdown(wait=True)` so resources are cleaned up normally
-4. Add a regression test where the wrapped function hangs in a loop, and assert the test finishes in under ~3 seconds with `ExecutionTimeoutError`
-5. Run `ruff check` / `ruff format --check` and `pytest tests/test_local_python_executor.py::TestTimeout` before opening the PR
+1. **Modify** `src/smolagents/local_python_executor.py`:
+   - Remove `with ThreadPoolExecutor(...)`
+   - Use explicit `executor.shutdown(wait=False)` on timeout, `shutdown(wait=True)` otherwise (via `finally` + `timed_out` flag)
+2. **Add** `test_timeout_decorator_does_not_deadlock_on_hanging_call` in `tests/test_local_python_executor.py`:
+   - Hanging loop with `threading.Event` so the worker can stop after the assertion
+   - Assert elapsed time under 3 seconds
+3. **Run** `ruff check` / `ruff format --check` on `examples`, `src`, `tests`
+4. **Run** `pytest tests/test_local_python_executor.py::TestTimeout`
+5. **Open PR** with `Fixes #2464`
 
-#### Key changes (as implemented)
+**Edge cases considered proactively:**
 
-**`src/smolagents/local_python_executor.py`:**
+| Case | Expected behavior after fix |
+|------|---------------------------|
+| Call completes within timeout | Returns normally; executor shuts down with `wait=True` |
+| Call exceeds timeout (`sleep` longer than limit) | Raises `ExecutionTimeoutError`; does not block on shutdown |
+| Call hangs forever (`while True` loop) | Raises `ExecutionTimeoutError` within ~timeout seconds; test finishes in under 3s |
+| Call from non-main thread | Still works (must not regress `test_timeout_works_in_thread`) |
+| Non-timeout exception in worker | Executor still shut down via `finally` with `wait=True` |
 
-- Create the executor manually instead of using `with`
-- Track `timed_out` when `FuturesTimeoutError` is raised
-- Use a `finally` block: `executor.shutdown(wait=not timed_out)` so timeout uses non-blocking shutdown and all other paths wait for the worker
+#### Review
 
-**`tests/test_local_python_executor.py`:**
+Self-review against project guidelines before coding:
 
-- Add `test_timeout_decorator_does_not_deadlock_on_hanging_call`
-- Use a `threading.Event` in the hanging loop so the background worker can stop after the assertion (addresses Copilot feedback on test hygiene)
+- [ ] Read [CONTRIBUTING.md](https://github.com/huggingface/smolagents/blob/main/CONTRIBUTING.md): `make quality` and `make test` expected before PR
+- [ ] CI (`.github/workflows/quality.yml`, `tests.yml`): `ruff` + full `pytest ./tests/` on Ubuntu
+- [ ] PR links issue: `Fixes #2464`
+- [ ] Diff limited to decorator fix + one regression test
+- [ ] No unrelated refactors
 
-#### Files to modify
+#### Evaluate
 
-| File | Change |
-|------|--------|
-| `src/smolagents/local_python_executor.py` | Fix `timeout()` shutdown behavior |
-| `tests/test_local_python_executor.py` | Add regression test for hanging calls |
+How I will verify the fix works:
 
-#### CONTRIBUTING.md checklist (reviewed before coding)
+| Check | Method |
+|-------|--------|
+| Regression test | `test_timeout_decorator_does_not_deadlock_on_hanging_call` passes in under 3s |
+| Existing behavior | All 11 tests in `TestTimeout` pass |
+| Lint/format | `ruff check examples src tests` and `ruff format --check examples src tests` pass |
+| Manual repro | Issue #2464 script raises `ExecutionTimeoutError` instead of freezing |
+| CI | GitHub Actions on PR #2465 (after maintainer approves workflows) |
 
-- Read [CONTRIBUTING.md](https://github.com/huggingface/smolagents/blob/main/CONTRIBUTING.md): run `make quality` and `make test` before submitting
-- CI runs `ruff check`, `ruff format --check`, and `pytest ./tests/` on Ubuntu
-- PR should link the issue with `Fixes #2464`
+*Implement: see Phase III.*
 
 ---
 
