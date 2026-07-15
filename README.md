@@ -9,7 +9,7 @@ CodePath AI301: My contribution journey from issue selection to merged pull requ
 |-------|---------|
 | **Name** | Lenin Goud Athikam |
 | **GitHub** | [@leninathikam](https://github.com/leninathikam) |
-| **Status** | Phase II Complete (PR open, awaiting maintainer review) |
+| **Status** | Phase III Complete (PR open, awaiting maintainer review) |
 | **Project** | [huggingface/smolagents](https://github.com/huggingface/smolagents), lightweight Python library for building AI agents |
 | **Issue** | [#2464](https://github.com/huggingface/smolagents/issues/2464): `local_python_executor.timeout()` deadlocks when the wrapped call hangs forever |
 | **PR** | [#2465](https://github.com/huggingface/smolagents/pull/2465): Fix: avoid deadlock in local_python_executor timeout decorator |
@@ -83,7 +83,7 @@ I picked this issue because:
 | **Python** | 3.14.3 (local); CI uses 3.10 and 3.12 on Ubuntu |
 | **Package** | smolagents 1.27.0.dev0 (cloned from `main`) |
 | **Fork** | [https://github.com/leninathikam/smolagents](https://github.com/leninathikam/smolagents) |
-| **Branch** | `fix/timeout-deadlock-2464` — [https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464](https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464) |
+| **Branch** | `fix/timeout-deadlock-2464` ΓÇö [https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464](https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464) |
 
 **Challenge encountered and fix:**
 
@@ -110,7 +110,7 @@ I picked this issue because:
 
 Steps another person could follow without extra context:
 
-1. Open `src/smolagents/local_python_executor.py` and locate the `timeout()` decorator (around lines 285–320).
+1. Open `src/smolagents/local_python_executor.py` and locate the `timeout()` decorator (around lines 285ΓÇô320).
 2. Create a small Python script (or REPL) with the reproduction from issue #2464:
    ```python
    import time
@@ -151,15 +151,15 @@ Restate the problem: The `timeout()` decorator must stop long-running agent code
 
 | Path | Role |
 |------|------|
-| `src/smolagents/local_python_executor.py` | `timeout()` decorator (~lines 285–325), `ExecutionTimeoutError` class |
-| `tests/test_local_python_executor.py` | `TestTimeout` class — existing timeout tests |
+| `src/smolagents/local_python_executor.py` | `timeout()` decorator (~lines 285ΓÇô325), `ExecutionTimeoutError` class |
+| `tests/test_local_python_executor.py` | `TestTimeout` class ΓÇö existing timeout tests |
 
 #### Match
 
 Analogous pattern already in the codebase:
 
 - **`test_timeout_works_in_thread`** (`tests/test_local_python_executor.py`, ~line 2238): Documents that the threading-based `timeout()` replaced signal-based timeouts because signals only work on the main thread. My fix must preserve timeout behavior when called from worker threads, not only the main thread.
-- **`timeout()` docstring** (lines 298–301): Already warns that timed-out threads keep running in the background. That matches using `shutdown(wait=False)` on timeout: we accept a leaked background thread rather than blocking the caller.
+- **`timeout()` docstring** (lines 298ΓÇô301): Already warns that timed-out threads keep running in the background. That matches using `shutdown(wait=False)` on timeout: we accept a leaked background thread rather than blocking the caller.
 - **Existing test `test_timeout_decorator_raises_error_when_exceeded`**: Uses `sleep(2)` with 1s timeout. This passes on buggy code because the worker eventually finishes. My new test must use a **non-terminating** hang to catch the shutdown deadlock.
 
 #### Plan
@@ -210,4 +210,91 @@ How I will verify the fix works:
 
 ---
 
-<!-- Phase III and IV to be added as work continues -->
+## Phase III: Implement
+
+### What I Built
+
+I implemented the fix planned in Phase II on branch [`fix/timeout-deadlock-2464`](https://github.com/leninathikam/smolagents/tree/fix/timeout-deadlock-2464) and opened [PR #2465](https://github.com/huggingface/smolagents/pull/2465) against `huggingface/smolagents` (`Fixes #2464`).
+
+**Net change:** +34 / -9 across 2 files.
+
+| File | Change |
+|------|--------|
+| `src/smolagents/local_python_executor.py` | Stop using `with ThreadPoolExecutor(...)` so timeout can call `shutdown(wait=False)` instead of blocking on `shutdown(wait=True)` |
+| `tests/test_local_python_executor.py` | Add `test_timeout_decorator_does_not_deadlock_on_hanging_call` regression test |
+
+### Code Changes
+
+**Before (deadlock path):**
+
+```python
+with ThreadPoolExecutor(max_workers=1) as executor:
+    future = executor.submit(func, *args, **kwargs)
+    try:
+        result = future.result(timeout=timeout_seconds)
+        return result
+    except FuturesTimeoutError:
+        raise ExecutionTimeoutError(...)
+# context manager exit always calls shutdown(wait=True) -> hang if worker never finishes
+```
+
+**After (non-blocking timeout path):**
+
+```python
+executor = ThreadPoolExecutor(max_workers=1)
+future = executor.submit(func, *args, **kwargs)
+timed_out = False
+try:
+    return future.result(timeout=timeout_seconds)
+except FuturesTimeoutError:
+    timed_out = True
+    raise ExecutionTimeoutError(
+        f"Code execution exceeded the maximum execution time of {timeout_seconds} seconds"
+    )
+finally:
+    # Do not wait for the stuck worker thread on timeout: shutdown(wait=True) would
+    # deadlock when the wrapped call hangs indefinitely.
+    executor.shutdown(wait=not timed_out)
+```
+
+**Regression test idea:** Use a `threading.Event`-gated loop so the worker can exit after the assertion. Assert `ExecutionTimeoutError` and that elapsed time is under 3 seconds. That catches the real deadlock case (`while True`-style hang), which the older `sleep(2)` test could miss because the worker eventually finishes and `shutdown(wait=True)` unblocks.
+
+### Local Verification
+
+| Check | Result |
+|-------|--------|
+| `pytest tests/test_local_python_executor.py::TestTimeout` | Passed (including the new hanging-call test) |
+| `ruff check` / `ruff format --check` on `examples`, `src`, `tests` | Passed |
+| Manual repro from issue #2464 (`@timeout(1)` + long sleep / hang) | Raises `ExecutionTimeoutError`; process continues |
+| Existing timeout behavior (success path, thread-safe timeout) | Unchanged; no regressions in `TestTimeout` |
+
+### Review Feedback Addressed
+
+GitHub Copilot reviewed the first commit and left two comments. I fixed both in a follow-up commit on the same PR.
+
+| Feedback | Fix |
+|----------|-----|
+| Success / non-timeout paths could leak the executor because `shutdown(wait=True)` sat in an `else` after an early `return` | Restructured with `timed_out` + `finally` so every exit path shuts down; timeout uses `wait=False`, everything else uses `wait=True` |
+| Hanging test loop had no stop condition, so the worker could live for the rest of the suite | Added `stop_event` and set it in a `finally` after the timeout assertion |
+
+### Commits
+
+| Commit | Message |
+|--------|---------|
+| [`3ec20ca`](https://github.com/leninathikam/smolagents/commit/3ec20ca7bac5615f5d714bb29fdc24c7dcae02a4) | `fix: avoid deadlock in local_python_executor timeout decorator` |
+| [`4886c2a`](https://github.com/leninathikam/smolagents/commit/4886c2ae80c82a48ec3b990fae66a53c7b9bfb81) | `address review: use finally for executor shutdown and stop hanging test thread` |
+
+### Challenges / Decisions
+
+- **Windows `.[dev]` install:** Same Phase II issue (`mlx[cpu]` is macOS-only). Kept using base install + manual test deps so I could run `pytest` and `ruff` locally.
+- **Do not kill the worker thread:** Python cannot force-stop a stuck thread. The intentional tradeoff (already noted in the decorator docstring) is a leaked background thread on timeout rather than freezing the caller. That matches `shutdown(wait=False)` on the timeout path.
+- **Keep the diff small:** Only the decorator and one regression test changed. No drive-by refactors, so review stays focused on the deadlock fix.
+- **CI on first-time contributors:** PR workflows still need maintainer approval before GitHub Actions runs on #2465. Local `TestTimeout` + ruff were the verification until CI is approved.
+
+### Phase III Status
+
+Implementation and local testing are done. PR [#2465](https://github.com/huggingface/smolagents/pull/2465) is open and waiting on maintainer review (and CI workflow approval). Phase IV will cover maintainer feedback, any follow-up commits, and merge outcome.
+
+---
+
+<!-- Phase IV to be added as work continues -->
